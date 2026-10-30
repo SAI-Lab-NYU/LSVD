@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Data, caches and results (never commit)
+data/
+groups/
+third_party/src/
+fake_quant/utils/experiments
+fake_quant/experiments
+logs/
+*.pt
+*.pth
+*.safetensors
+*.out
+*.log
+
+# Internal release notes (never commit)
+*_INTERNAL.md
+
+# Kernel autotune caches and benchmark results
+kernels/autotune_cache/
+results/

@@ -1,0 +1,471 @@
+import torch
+import torch.nn as nn
+import transformers
+from utils import (
+    utils,
+    model_utils,
+    data_utils,
+    quant_utils,
+    rotation_utils,
+    gptq_utils,
+    hadamard_utils,
+    svd_utils,
+    profile_utils,
+    vlm_eval_suite,
+)
+import logging
+import os
+import torch.distributed as dist
+import datetime
+from utils.main_runtime_utils import (
+    get_rank_and_world_size,
+    initialize_distributed_for_evaluation,
+    load_env,
+    _run_lm_svd,
+)
+
+
+@torch.no_grad()
+def _profile(dataloader, args, model, image_processor, tokenizer, out=False):
+    dtype = next(iter(model.parameters())).dtype
+    inps = []
+    outs = torch.zeros(
+        (args.vitnsamples, model.vision_tower.num_patches, model.vision_tower.config.hidden_size*5), dtype=dtype, device=utils.get_dev()
+    ) if out else None
+    cache = {'i': 0, 'attention_mask': [], 'position_embeddings':[]}
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+        def forward(self, inp, *args, **kwargs):
+            inps.append(inp)
+            cache['i'] += 1
+            raise ValueError
+    class Catcherout(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+        def forward(self, inp, *args, **kwargs):
+            inps[cache['i']] = inp
+            inp = self.module(inp)
+            outs[cache['i']] = inp
+            cache['i'] += 1
+            raise ValueError
+    
+    layers = model.vision_tower.vision_model.encoder.layers
+    model.vision_tower = model.vision_tower.to(utils.get_dev())
+    layer = model.multi_modal_projector
+    layer = layer.to(utils.get_dev())
+
+    
+    if out:
+        layer.linear_1 = Catcherout(layer.linear_1)
+    else:
+        layer.linear_1 = Catcher(layer.linear_1)
+    
+    # llava-next language model nesting differs across versions.
+    if hasattr(model.language_model, "model") and hasattr(model.language_model.model, "embed_tokens"):
+        model.language_model.model.embed_tokens = model.language_model.model.embed_tokens.to(utils.get_dev())
+    elif hasattr(model.language_model, "embed_tokens"):
+        model.language_model.embed_tokens = model.language_model.embed_tokens.to(utils.get_dev())
+    else:
+        raise AttributeError("Cannot locate embed_tokens under model.language_model.")
+
+    for batch in dataloader:
+        try:
+            inputs, _ = gptq_utils.message_to_prompt(batch, image_processor, model, tokenizer)
+            
+            
+            model.generate(**inputs,
+                            max_new_tokens=1,
+                            use_cache=True,)
+        except ValueError:
+            pass
+
+    layer.linear_1 = layer.linear_1.module
+    layer = layer.cpu()
+    layers = layers.cpu()
+    if out:
+        return inps, outs
+    return inps
+
+
+def _eval_output_tag(dataset):
+    return vlm_eval_suite.output_tag(dataset)
+
+
+def _evaluate_one_dataset(model, args, tokenizer, image_processor):
+    return vlm_eval_suite.evaluate_one_dataset(
+        model,
+        args,
+        tokenizer,
+        image_processor,
+        llava_next=True,
+    )
+
+
+def main(args):
+    
+    model, tokenizer, image_processor = model_utils.get_model(args.model, args.hf_token)
+    model.eval()
+    modeldtype = model.dtype
+    model.vision_tower.to(modeldtype)
+    print(model.vision_tower.dtype)
+    # SVD is performed before LM rotation in this entrypoint.
+    args.pre_svd_rotate = False
+    if args.svd_lm and not args.beta_then_svd:
+        _run_lm_svd(model, args, tokenizer, image_processor)
+
+    
+    if args.vit_module:
+        ### todo add vit learning whole process here
+        if not args.vit_online:
+            trainloader = data_utils.get_loaders(
+                args.cal_dataset, nsamples=args.vitnsamples,
+                seed=args.seed, model=args.model,
+                seqlen=model.seqlen, eval_mode=False
+            )
+            dataloader, _ = trainloader
+            utils.set_seed(args.seed) # do we need this?
+            del trainloader
+            inpsfp16= _profile(dataloader, args, model, image_processor, tokenizer)
+        config = model.vision_tower.config # do not know if this works
+        
+        if args.rotate:
+            if args.vit_online:
+                rotation_utils.wrap_layer_normvit(model) # just ignore for now
+                if args.mm_rh:
+                    Q, Qmm = rotation_utils.rotate_modelvitmmonlineR_mmR(model, args)
+                else:
+                    Q = rotation_utils.rotate_modelvitmmonlineR(model, args)
+                if args.vit_mmoff:
+                    logging.info('mm proj rotation check again, skip them')
+                utils.cleanup_memory(verbos=True)
+            else:
+                rotation_utils.fuse_layer_normsvit_returnskip(model)
+                qlayers = model.vision_tower.vision_model # here add online hadamard for pre-ln
+                qlayers.pre_layrnorm = model_utils.LNRotWrapper(qlayers.pre_layrnorm) # centering for vit
+                if args.mm_rh:
+                    Q, Qmm = rotation_utils.rotate_modelvitmmv2(model, args)
+                else:
+                    Q = rotation_utils.rotate_modelvitmmv2(model, args)
+                utils.cleanup_memory(verbos=True)
+            quant_utils.add_actquant(model.vision_tower.vision_model) #Add Activation Wrapper to the model
+            
+            quant_utils.add_actquant(model.multi_modal_projector)
+            qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+            
+            for name in qlayers:# for clip, todo here
+                if 'fc2' in name:
+                    qlayers[name].online_random_had = True
+                    qlayers[name].had_K = Q
+                    qlayers[name].K = 1
+                    qlayers[name].fp32_had = args.fp32_had
+                if 'out_proj' in name: # why need this if already done ov_rotate in rotate_model
+                    had_K, K = hadamard_utils.get_hadK(config.num_attention_heads)
+                    qlayers[name].online_partial_had = True
+                    qlayers[name].had_K = had_K
+                    qlayers[name].K = K
+                    qlayers[name].had_dim = config.hidden_size//config.num_attention_heads
+                    qlayers[name].fp32_had = args.fp32_had
+                if 'multi_modal_projector.linear_1' in name and args.vit_online and not args.vit_mmoff:
+                    logging.info('use mmproj input[0] online rotation')
+                    had_K, K = hadamard_utils.get_hadK(model.config.vision_config.hidden_size)
+                    qlayers[name].online_full_had = True
+                    qlayers[name].had_K = had_K
+                    qlayers[name].K = K
+                    qlayers[name].fp32_had = args.fp32_had
+                if 'multi_modal_projector.linear_2' in name and not args.vit_mmoff:
+                    if args.mm_rh:# for now, we do not inplement fused yet
+                        logging.info('use mmproj input[2] online RH rotation')
+                        qlayers[name].online_random_had = True
+                        qlayers[name].had_K = Qmm
+                        qlayers[name].K = 1
+                        qlayers[name].fp32_had = args.fp32_had
+                    else:
+                        logging.info('use mmproj input[2] online Had rotation')
+                        had_K, K = hadamard_utils.get_hadK(model.config.text_config.hidden_size)
+                        qlayers[name].online_full_had = True
+                        qlayers[name].had_K = had_K
+                        qlayers[name].K = K
+                        qlayers[name].fp32_had = args.fp32_had
+        else:
+            quant_utils.add_actquant(model.vision_tower.vision_model) #Add Activation Wrapper to the model as the rest of the code assumes it is present
+            quant_utils.add_actquant(model.multi_modal_projector)
+        if args.w_bits < 16:
+            save_dict = {}
+            if args.load_qmodel_path: # Load Quantized Rotated Model
+                assert args.rotate, "Model should be rotated to load a quantized model!"
+                assert not args.save_qmodel_path, "Cannot save a quantized model if it is already loaded!"
+                # The checkpoint contains the complete ViT + LM model after
+                # LM SVD conversion, norm fusion, rotation, and quantization.
+                # At this point only the ViT structure has been prepared, so a
+                # strict full-model load would compare the transformed LM
+                # tensors against the still-dense base LM.  Defer the one
+                # full-model load to the LM block below, after both halves have
+                # exactly the same structure as the saved model.
+                logging.info(
+                    "Deferring quantized checkpoint load until LM reconstruction is complete: %s",
+                    args.load_qmodel_path,
+                )
+                
+            elif not args.w_rtn: # GPTQ Weight Quantization
+                trainloader = data_utils.get_loaders(
+                    args.cal_dataset, nsamples=args.nsamples,
+                    seed=args.seed, model=args.model,
+                    seqlen=model.seqlen, eval_mode=False
+                )# use the same or not
+                utils.set_seed(args.seed)
+                quantizers = gptq_utils.gptq_fwrdvithf(model, trainloader, utils.get_dev(), args, tokenizer, image_processor)
+                save_dict["w_vitquantizers"] = quantizers
+                if not args.vit_mmoff:
+                    quantizers = gptq_utils.gptq_fwrdmmhf(model, trainloader, utils.get_dev(), args, tokenizer, image_processor)
+                    save_dict["w_mmquantizers"] = quantizers
+            else: # RTN Weight Quantization
+                quantizers = gptq_utils.rtn_fwrdvit(model, utils.get_dev(), args)
+                save_dict["w_vitquantizers"] = quantizers
+                if not args.vit_mmoff:
+                    quantizers = gptq_utils.rtn_fwrdmm(model, utils.get_dev(), args)
+                    save_dict["w_mmquantizers"] = quantizers
+
+
+        # Add vit Input Quantization
+        if args.a_bits < 16 or args.v_bits < 16:
+            logging.info(f'setting a clip ratio in vit {min(args.a_clip_ratio, args.vita_clip_ratio)}')
+            qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+            down_proj_groupsize = -1
+            if args.a_groupsize > 0 and ("llama" in args.model or 'llava' in args.model): # here change as well  for all
+                down_proj_groupsize = utils.llama_down_proj_groupsize(model, args.a_groupsize)
+            for name in qlayers:
+                layer_input_bits = args.a_bits
+                layer_groupsize = args.a_groupsize
+                layer_a_sym = not(args.a_asym)
+                layer_a_clip = min(args.a_clip_ratio, args.vita_clip_ratio)
+                if 'lm_head' in name: #Skip lm_head quantization   
+                    layer_input_bits = 16
+                
+                if 'fc2' in name: #Set the down_proj precision
+                    if args.int8_down_proj:
+                        layer_input_bits = 8
+                    layer_groupsize = down_proj_groupsize
+
+                if 'mm_projector' in name and args.vit_mmoff:
+                    logging.info(f"mm projector act in {16} bit")
+                    layer_input_bits = 16 # skip vit mm act quant
+                qlayers[name].quantizer.configure(bits=layer_input_bits,
+                                                groupsize=layer_groupsize,
+                                                sym=layer_a_sym,
+                                                clip_ratio=layer_a_clip)
+        if not args.vit_online:
+            inpsquant = _profile(dataloader, args, model, image_processor, tokenizer) 
+        if world_size > 1:
+            dist.barrier()
+        if not args.nobeta and not args.vit_online and args.rotate:
+            from utils import beta_utils
+            try:
+                beta_path=None
+                linearbias = torch.load(beta_path)
+                logging.info(f"use beta from {beta_path}")
+            except:
+                weight = None
+                bias_ = None
+                Q = model.vision_tower.vision_model.pre_layrnorm.had_K
+                linearbias = beta_utils.train_bias_linear(inpsfp16, inpsquant, args.beta_epochs, args.beta_lr, Q, args=args, weight=weight, bias=bias_)
+            beta_utils.fuse_linearbias(linearbias, model, is_mm=True)
+            del linearbias
+            del inpsfp16
+            del inpsquant
+            utils.cleanup_memory(verbos=True)
+    if args.svd_emb:
+        svd_utils.svd_emb(model, args)
+    
+    if args.svd_lm and args.beta_then_svd:
+        _run_lm_svd(model, args, tokenizer, image_processor)
+        
+    if not args.lm_off:
+        # Rotate the weights
+        if args.rotate:
+            model = model.cpu()
+            if args.svd_lm:
+                rotation_utils.fuse_layer_norms_noebsvdqkv(model, args.svd_modules)
+                rotation_utils.rotate_modelllavasvdqkv(model, args)
+            else:
+                rotation_utils.fuse_layer_norms_noeb(model)
+                rotation_utils.rotate_modelllava(model, args)
+            utils.cleanup_memory(verbos=True)
+            quant_utils.add_actquant(model_utils.get_layers(model)) #Add Activation Wrapper to only the LM model
+            qlayers = quant_utils.find_qlayers(model)
+            for name in qlayers:# for clip, todo here
+                if 'down_proj' in name:
+                    if args.svd_modules in ['all', 'mlp'] and 'ALinear' in name:
+                        continue
+                    had_K, K = hadamard_utils.get_hadK(model.config.text_config.intermediate_size)
+                    qlayers[name].online_full_had = True
+                    qlayers[name].had_K = had_K
+                    qlayers[name].K = K
+                    qlayers[name].fp32_had = args.fp32_had
+                if 'o_proj' in name:
+                    had_K, K = hadamard_utils.get_hadK(model.config.text_config.num_attention_heads)
+                    qlayers[name].online_partial_had = True
+                    qlayers[name].had_K = had_K
+                    qlayers[name].K = K
+                    qlayers[name].had_dim = model.config.text_config.hidden_size//model.config.text_config.num_attention_heads
+                    qlayers[name].fp32_had = args.fp32_had
+        else:
+            quant_utils.add_actquant(model_utils.get_layers(model)) #Add Activation Wrapper to the model as the rest of the code assumes it is present
+        
+        if args.profile_method:
+            if args.vit_online:
+                trainloader = data_utils.get_loaders(
+                    args.cal_dataset, nsamples=args.vitnsamples,
+                    seed=args.seed, model=args.model,
+                    seqlen=model.seqlen, eval_mode=False
+                )
+                dataloader, _ = trainloader
+                utils.set_seed(args.seed)
+                del trainloader
+            layer_ids = [0, 1, 2, 20, 21, 22, 37, 38, 39]
+            profile_utils.save_layer(model, layer_ids, 'before_weight_quant', args)
+            activations = {}
+            hooks = profile_utils.register_detailed_hooksv2svdqkvout(model, activations)
+            profile_utils._profile(dataloader, args, model, image_processor, tokenizer)
+            torch.save(activations, f"{args.save_path}/before_quant_act.pth")
+            del activations
+            profile_utils.remove_hooks(hooks)
+
+        if args.w_bits < 16:
+            save_dict = {}
+            if args.load_qmodel_path: # Load Quantized Rotated Model
+                assert args.rotate, "Model should be rotated to load a quantized model!"
+                assert not args.save_qmodel_path, "Cannot save a quantized model if it is already loaded!"
+                print("Load quantized model from ", args.load_qmodel_path)
+                # This checkpoint was generated locally by the same job and
+                # contains WeightQuantizer objects in addition to tensors.
+                save_dict = torch.load(args.load_qmodel_path, weights_only=False)
+                # Some Hadamard buffers originate from inference-mode model
+                # construction.  Loading under inference_mode makes their
+                # in-place state_dict copies legal without weakening strict
+                # architecture/key validation.
+                with torch.inference_mode():
+                    model.load_state_dict(save_dict["model"])
+                
+            elif not args.w_rtn: # GPTQ Weight Quantization
+                assert ("llama" in args.model or 'llava' in args.model), "Only llama/llava is supported for GPTQ!"
+                
+                trainloader = data_utils.get_loaders(
+                    args.cal_dataset, nsamples=args.nsamples,
+                    seed=args.seed, model=args.model,
+                    seqlen=model.seqlen, eval_mode=False
+                )
+                if args.qkv_fuse and args.svd_lm:
+                    quantizers = gptq_utils.gptq_fwrdllavasvd_qkv(model, trainloader, utils.get_dev(), args, tokenizer, image_processor)
+                else:
+                    quantizers = gptq_utils.gptq_fwrdllava(model, trainloader, utils.get_dev(), args, tokenizer, image_processor)
+                save_dict["w_quantizers"] = quantizers
+            else: # RTN Weight Quantization
+                quantizers = gptq_utils.rtn_fwrd(model, utils.get_dev(), args) #, start_id=start_id
+                save_dict["w_quantizers"] = quantizers
+                # currently only support RTN
+                
+            if args.save_qmodel_path:
+                save_dict["model"] = model.state_dict()
+                torch.save(save_dict, args.save_qmodel_path)
+
+        if args.profile_method:
+            pass
+
+        # Add Input Quantization
+        if args.a_bits < 16 or args.v_bits < 16:
+            logging.info(f'setting a clip ratio in lm {min(args.a_clip_ratio, args.lma_clip_ratio)}')
+            qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+            down_proj_groupsize = -1
+            if args.a_groupsize > 0 and "llama" in args.model:
+                down_proj_groupsize = utils.llama_down_proj_groupsize(model, args.a_groupsize)
+            for name in qlayers:
+                layer_input_bits = args.a_bits
+                layer_groupsize = args.a_groupsize
+                layer_a_sym = not(args.a_asym)
+                layer_a_clip = min(args.a_clip_ratio, args.lma_clip_ratio)
+                if 'v_proj' in name and args.v_bits < 16: #Set the v_proj precision
+                    qlayers[name].out_quantizer.configure(bits=args.v_bits,
+                                                groupsize=args.v_groupsize,
+                                                sym=not(args.v_asym),
+                                                clip_ratio=args.v_clip_ratio)
+                
+                if 'lm_head' in name: #Skip lm_head quantization   
+                    layer_input_bits = 16
+                
+                if 'down_proj' in name: #Set the down_proj precision
+                    if args.int8_down_proj:
+                        layer_input_bits = 8
+                    layer_groupsize = down_proj_groupsize
+
+                if 'BLinear' in name and args.is_per_head_svd:
+                    logging.info(f"Set up latent actquant using out_actquant")
+                    # quick fix for qat SVDLinear
+                    qlayers[name].out_quantizer.configure(bits=layer_input_bits,
+                                                groupsize=layer_groupsize,
+                                                sym=layer_a_sym,
+                                                clip_ratio=layer_a_clip)
+
+                qlayers[name].quantizer.configure(bits=layer_input_bits,
+                                                groupsize=layer_groupsize,
+                                                sym=layer_a_sym,
+                                                clip_ratio=layer_a_clip)
+
+        if args.k_bits < 16:
+            if args.k_pre_rope:
+                raise NotImplementedError("Pre-RoPE quantization is not supported yet!")
+            else:
+                rope_function_name = model_utils.get_rope_function_name(model)
+                layers = model_utils.get_layers(model)
+                k_quant_config = {'k_bits':args.k_bits, "k_groupsize": args.k_groupsize,
+                                            "k_sym": not(args.k_asym), "k_clip_ratio": args.k_clip_ratio}
+                for layer in layers:
+                    rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
+                                layer.self_attn, 
+                                rope_function_name, 
+                                config=model.config,
+                                **k_quant_config)
+                logging.info('finish qk rotation and k quant')
+
+    if args.profile_method:
+        activations = {}
+        hooks = profile_utils.register_detailed_hooksv2svdqkvout(model, activations)
+        profile_utils._profile(dataloader, args, model, image_processor, tokenizer)
+        torch.save(activations, f"{args.save_path}/after_AWquant_act.pth")
+        del activations
+        profile_utils.remove_hooks(hooks)
+        logging.info("Skip evaluation for profile calibrated results")
+        return
+    if args.skip_evaluation:
+        logging.info("Model preparation completed; skipping evaluation as requested.")
+        return
+    initialize_distributed_for_evaluation()
+    dataset_scores = vlm_eval_suite.evaluate_datasets(
+        model,
+        args,
+        tokenizer,
+        image_processor,
+        llava_next=True,
+    )
+    if args.wandb:
+        import wandb
+
+        for dataset_name, dataset_score in dataset_scores.items():
+            wandb.log({'ppl/{}'.format(dataset_name.upper()): dataset_score})
+
+
+if __name__ == '__main__':
+    args = load_env() # args/seeds setup before distributed setup
+    rank, world_size = get_rank_and_world_size()
+    if world_size > 1:
+        local_rank = os.environ.get('LOCAL_RANK', 0)
+        torch.cuda.set_device(int(local_rank))
+        dist.init_process_group(
+            backend=os.environ.get('DIST_BACKEND', 'nccl'),
+            timeout=datetime.timedelta(seconds=int(os.environ.get('DIST_TIMEOUT', 3600)))
+        )
+    main(args)
+    if dist.is_initialized():
+        dist.destroy_process_group()

@@ -1,0 +1,40 @@
+LSVD: Loss-Aware Low-Rank Approximation for Efficient Low-Precision VLMs
+Copyright 2026 The LSVD Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository builds on code and ideas from the following projects. Portions of the code
+in fake_quant/ are adapted from them; their copyright notices and licenses continue to apply
+to those portions.
+
+* WSVD: Weighted Low-Rank Approximation for Fast and Efficient Execution of Low-Precision
+  Vision-Language Models (ICLR 2026) - https://openreview.net/forum?id=zrmQ4koOw9
+  LSVD was developed on top of the WSVD code base (Apache License 2.0); the WSVD baseline
+  (local fine-tuning / local QAT) is included for comparison.
+
+* QSVD: Efficient Low-rank Approximation for Unified Query-Key-Value Weight Compression in
+  Low-Precision Vision-Language Models - https://github.com/SAI-Lab-NYU/QSVD
+  (Apache License 2.0). QSVD baseline and gradient-information rank allocation.
+
+* QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs - https://github.com/spcl/QuaRot
+  (Apache License 2.0). Rotation, Hadamard, RTN/GPTQ quantization utilities and the
+  fake-quantization framework.
+
+* SVD-LLM: Truncation-aware Singular Value Decomposition for Large Language Model Compression
+  - https://github.com/AIoT-MLSys-Lab/SVD-LLM. Cholesky-whitened SVD baseline.
+
+* ASVD: Activation-aware Singular Value Decomposition for Compressing Large Language Models
+  - https://github.com/hahnyuan/ASVD4LLM. Activation-aware scaling (--calib_method abs_mean).
+
+* LLaVA - https://github.com/haotian-liu/LLaVA (Apache License 2.0). Model loading for
+  LLaVA-v1.5; scripts/setup/convert_sqa_to_llava*.py are adapted from LLaVA
+  (see scripts/setup/LICENSE.LLaVA).
+
+* VLMEvalKit - https://github.com/open-compass/VLMEvalKit (Apache License 2.0). Evaluation
+  datasets and scoring.
+
+* fast-hadamard-transform - https://github.com/Dao-AILab/fast-hadamard-transform
+  (BSD 3-Clause License). Installed as a dependency, not redistributed.
+
+* LightLLM - https://github.com/ModelTC/LightLLM (Apache License 2.0). The flash-decoding Triton
+  kernels in kernels/layer_bench/fd_kernel/ are adapted from LightLLM's token-decoding kernels.
